@@ -1,0 +1,399 @@
+import torch
+import math
+import torch.nn as nn
+from timm.models.vision_transformer import PatchEmbed, Block
+from util.pos_embed import get_2d_sincos_pos_embed
+
+
+class SelfAttention(nn.Module):
+    def __init__(self, embed_dim, num_heads):
+        super(SelfAttention, self).__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+
+        assert (
+            self.head_dim * num_heads == embed_dim
+        ), "Embedding dimension needs to be divisible by num_heads"
+
+        self.values = nn.Linear(embed_dim, embed_dim)
+        self.keys = nn.Linear(embed_dim, embed_dim)
+        self.queries = nn.Linear(embed_dim, embed_dim)
+
+    def forward(self, x):
+        # Split input into self.num_heads different parts
+        batch_size, seq_length, _ = x.shape
+        values = self.values(x)
+        keys = self.keys(x)
+        queries = self.queries(x)
+
+        values = values.view(batch_size, seq_length, self.num_heads, self.head_dim)
+        keys = keys.view(batch_size, seq_length, self.num_heads, self.head_dim)
+        queries = queries.view(batch_size, seq_length, self.num_heads, self.head_dim)
+
+        values = values.permute(0, 2, 1, 3)
+        keys = keys.permute(0, 2, 1, 3)
+        queries = queries.permute(0, 2, 1, 3)
+
+        energy = torch.matmul(queries, keys.permute(0, 1, 3, 2))
+        attention = torch.nn.functional.softmax(energy, dim=-1)
+
+        out = torch.matmul(attention, values)
+        out = out.permute(0, 2, 1, 3).contiguous().view(batch_size, seq_length, self.embed_dim)
+
+        return out
+
+#初版门控机制
+# class ModalGate(nn.Module):
+#     """A lightweight gating branch that adaptively re-weights modal features."""
+#
+#     def __init__(self, embed_dim: int, hidden_ratio: float = 0.5):
+#         super().__init__()
+#         hidden_dim = max(1, int(embed_dim * hidden_ratio))
+#         self.mlp = nn.Sequential(
+#             nn.Linear(embed_dim * 2, hidden_dim, bias=True),
+#             nn.GELU(),
+#             nn.Linear(hidden_dim, embed_dim * 2, bias=True),
+#         )
+#         self.activation = nn.Sigmoid()
+#
+#     def forward(self, vi_feat: torch.Tensor, ir_feat: torch.Tensor):
+#         # vi_feat / ir_feat: (B, N, C)
+#         gate_input = torch.cat([vi_feat, ir_feat], dim=-1)
+#         modal_weights = self.activation(self.mlp(gate_input))
+#         vi_gate, ir_gate = modal_weights.chunk(2, dim=-1)
+#         return vi_feat * vi_gate, ir_feat * ir_gate
+
+class ModalGate(nn.Module):
+    """A lightweight gating branch that adaptively re-weights modal features."""
+
+    def __init__(self, embed_dim: int, hidden_ratio: float = 0.5):
+        super().__init__()
+        hidden_dim = max(1, int(embed_dim * hidden_ratio))
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim * 2, hidden_dim, bias=True),
+            nn.GELU(),
+            nn.Linear(hidden_dim, embed_dim * 2, bias=True),
+        )
+
+        # 关键初始化：
+        # 使模块在训练开始时接近恒等映射 (feat * (1 + 0))
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+        self.activation = nn.Sigmoid()
+        # Depthwise smoothing keeps neighbouring tokens consistent while
+        # preserving channel independence.
+        self.spatial_smooth = nn.Conv2d(
+            embed_dim * 2,
+            embed_dim * 2,
+            kernel_size=3,
+            padding=1,
+            groups=embed_dim * 2,
+            bias=False,
+        )
+        self._reset_parameters()
+
+    def _reset_parameters(self) -> None:
+        nn.init.constant_(self.spatial_smooth.weight, 1.0 / 9.0)
+
+    def forward(self, vi_feat: torch.Tensor, ir_feat: torch.Tensor):
+        # vi_feat / ir_feat: (B, N, C)
+        gate_input = torch.cat([vi_feat, ir_feat], dim=-1)
+        #modal_weights = self.activation(self.mlp(gate_input))
+        modal_weights = self.mlp(gate_input)
+
+        b, n, c2 = modal_weights.shape
+        # Attempt to reshape into a 2D grid for spatial smoothing. If the
+        # sequence length cannot form a square (e.g. includes cls tokens), we
+        # skip the spatial filtering to avoid shape issues.
+        grid_size = int(math.sqrt(n))
+        if grid_size * grid_size == n:
+            modal_weights = (
+                modal_weights.view(b, grid_size, grid_size, c2)
+                .permute(0, 3, 1, 2)
+            )
+            modal_weights = self.spatial_smooth(modal_weights)
+            modal_weights = modal_weights.permute(0, 2, 3, 1).reshape(b, n, c2)
+
+        vi_gate, ir_gate = modal_weights.chunk(2, dim=-1)
+
+        #Tanh压缩门控信号到[-1, 1]
+        vi_gate = torch.tanh(vi_gate)
+        ir_gate = torch.tanh(ir_gate)
+
+        #return vi_feat * vi_gate, ir_feat * ir_gate
+        #应用门控，允许缩放范围为 [0, 2]
+        return vi_feat * (1 + vi_gate), ir_feat * (1 + ir_gate)
+
+class SE_Block(nn.Module):
+    def __init__(self, inchannel, ratio=16):
+        super(SE_Block, self).__init__()
+        # 全局平均池化(Fsq操作)
+        self.gap = nn.AdaptiveAvgPool2d((1, 1))
+        # 两个全连接层(Fex操作)
+        self.fc = nn.Sequential(
+            nn.Linear(inchannel, inchannel // ratio, bias=False),  # 从 c -> c/r
+            nn.ReLU(),
+            nn.Linear(inchannel // ratio, inchannel, bias=False),  # 从 c/r -> c
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        # 读取批数据图片数量及通道数
+        b, c, h, w = x.size()
+        # Fsq操作：经池化后输出b*c的矩阵
+        y = self.gap(x).view(b, c)
+        # Fex操作：经全连接层输出（b，c，1，1）矩阵
+        y = self.fc(y).view(b, c, 1, 1)
+        # Fscale操作：将得到的权重乘以原来的特征图x
+        return x * y.expand_as(x)
+
+class FPN(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(FPN, self).__init__()
+        
+        self.downsample1 = self.downsample_block(in_channels, in_channels)
+        self.downsample2 = self.downsample_block(in_channels, in_channels)
+        
+        self.upsample2 = self.upsample_block(in_channels, out_channels)
+        self.upsample1 = self.upsample_block(out_channels, out_channels)
+        
+    def downsample_block(self, in_channels, out_channels):
+        return nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm2d(out_channels)
+        )
+    
+    def upsample_block(self, in_channels, out_channels):
+        return nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm2d(out_channels)
+        )
+    
+    def forward(self, x):
+        
+        x1 = self.downsample1(x)
+        x2 = self.downsample2(x1)
+        
+        x_up2 = self.upsample2(x2)
+        x_up1 = self.upsample1(x_up2 + x1)
+        
+        return x_up1
+
+
+class Feature_Net(nn.Module):
+    def __init__(self, dim):
+        super(Feature_Net, self).__init__()
+        
+        # 第一层卷积层：输入通道数1024，输出通道数2048，卷积核大小3x3，填充1
+        self.conv1 = nn.Conv2d(in_channels=dim, out_channels=dim*2, kernel_size=3, padding=1)
+        self.relu1 = nn.ReLU(inplace=True)
+        self.bn1   = nn.BatchNorm2d(num_features=dim*2)
+        
+        # 第二层卷积层：输入通道数2048，输出通道数2048，卷积核大小3x3，填充1
+        self.conv2 = nn.Conv2d(in_channels=dim*2, out_channels=dim*2, kernel_size=3, padding=1)
+        self.relu2 = nn.ReLU(inplace=True)
+        self.bn2   = nn.BatchNorm2d(num_features=dim*2)
+        
+        # 第三层卷积层：输入通道数2048，输出通道数1024，卷积核大小3x3，填充1
+        self.conv3 = nn.Conv2d(in_channels=dim*2, out_channels=dim*2, kernel_size=3, padding=1)
+        self.relu3 = nn.ReLU(inplace=True)
+        self.bn3   = nn.BatchNorm2d(num_features=dim*2)
+        
+        # 第四层卷积层：输入通道数1024，输出通道数1024，卷积核大小3x3，填充1
+        self.conv4 = nn.Conv2d(in_channels=dim*2, out_channels=dim, kernel_size=3, padding=1)
+        self.relu4 = nn.ReLU(inplace=True)
+        #self.bn4   = nn.BatchNorm2d(num_features=dim)
+        
+    def forward(self, x):
+        # 前向传播过程
+        x = self.bn1(self.relu1(self.conv1(x)))
+        x = self.bn2(self.relu2(self.conv2(x)))
+        x = self.bn3(self.relu3(self.conv3(x)))
+        x = self.relu4(self.conv4(x))
+        return x
+    
+
+class cross_fusion(nn.Module):  #tradition cross*2
+    def __init__(self,embed_dim, mode='eval'):
+        super(cross_fusion, self).__init__()
+        self.cross_model = nn.MultiheadAttention(embed_dim = embed_dim, num_heads = 16)
+        self.merge_model = nn.MultiheadAttention(embed_dim = embed_dim, num_heads = 16)
+        self.pos_embed = nn.Parameter(torch.zeros(1, 1600, embed_dim), requires_grad=False)
+        self.embed_dim = embed_dim
+        self.fc1 = nn.Linear(self.embed_dim, self.embed_dim*4, bias=True)
+        self.fc2 = nn.Linear(self.embed_dim*4, self.embed_dim, bias=True)
+        self.gelu = nn.GELU()
+        self.ln = nn.LayerNorm(self.embed_dim)
+        self.modal_gate = ModalGate(embed_dim)#门控
+        self.initialize_weights()
+        self.mode = mode
+        self._set_trainable_blocks(self.mode)
+
+    def initialize_weights(self):
+        pos_embed = get_2d_sincos_pos_embed(self.embed_dim, 40, cls_token=False)
+        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+
+    def _set_trainable_blocks(self, mode):
+        #只训练MFM或者MFM和decoder，不训练CFM时，CFM冻结
+        if mode == 'train_MFM_mean_CFM_lock' or mode == 'train_MFM_fusion_CFM_lock' or mode == 'train_decoder_MFM':
+            for param in self.cross_model.parameters():
+                param.requires_grad = False
+
+    def forward(self, vi_latent, ir_latent):
+        vi_latent += self.pos_embed
+        ir_latent += self.pos_embed
+        vi_patten,_  = self.cross_model(ir_latent,vi_latent,vi_latent)  #q,k,v
+        ir_patten,_  = self.cross_model(vi_latent,ir_latent,ir_latent)
+        patten = vi_patten + ir_patten
+        if self.mode == 'train_CFM_mean' or self.mode == 'train_CFM_fusion':
+            return patten
+        vi_final,_   = self.merge_model(patten,vi_latent,vi_latent)
+        ir_final,_   = self.merge_model(patten,ir_latent,ir_latent)
+        fusion       = (vi_final + ir_final)
+        # vi_gated, ir_gated = self.modal_gate(vi_final, ir_final)
+        # fusion = (vi_gated + ir_gated)
+        ffn = self.fc2(self.gelu(self.fc1(fusion)))
+        out = self.ln(ffn+fusion)
+        return out
+
+
+    
+class Seg_module(nn.Module):
+    def __init__(self, embed_dim, img_size):
+        super(Seg_module, self).__init__()
+        #self.FPN = FPN(embed_dim, embed_dim)
+
+        self.embed_dim = embed_dim
+        self.decoder_embed_dim = 512
+        self.patch_size = 16
+        self.patch_embed = PatchEmbed(img_size, 16, 3, embed_dim)
+        num_patches = self.patch_embed.num_patches
+        self.decoder_embed = nn.Linear(embed_dim, self.decoder_embed_dim, bias=True)
+        self.decoder_pos_embed = nn.Parameter(torch.zeros(1, num_patches, self.decoder_embed_dim), requires_grad=False)  # fixed sin-cos embedding
+
+        self.decoder_blocks = nn.ModuleList([
+            Block(self.decoder_embed_dim, 16, 4, qkv_bias=True, qk_scale=None, norm_layer=nn.LayerNorm)
+            for i in range(4)])
+
+        self.decoder_norm = nn.LayerNorm(512)
+        self.decoder_pred = nn.Linear(self.decoder_embed_dim, 16**2 * 3, bias=True)
+    
+    def decoder(self, x):
+        x = self.decoder_embed(x)
+        x = x + self.decoder_pos_embed
+        for blk in self.decoder_blocks:
+            x = blk(x)
+        x = self.decoder_norm(x)
+        x = self.decoder_pred(x)
+        return x
+
+
+    def unpatchify(self,x):
+        """
+        x: (N, L, patch_size**2 *3)
+        imgs: (N, 3, H, W)
+        """
+        
+        h = w = int(x.shape[1]**.5)
+        assert h * w == x.shape[1]
+        x = x.reshape(shape=(x.shape[0], h, w, self.embed_dim))#1024
+        x = torch.einsum('nhwc->nchw', x)
+        
+        return x
+
+    def patchify(self, imgs):
+        """
+        imgs: (N, 3, H, W)
+        x: (N, L, patch_size**2 *3)
+        """
+        
+        h = w = imgs.shape[2]
+        x = torch.einsum('nchw->nhwc', imgs)
+        x = x.reshape(shape=(imgs.shape[0], h * w, self.embed_dim))#1024
+        return x
+    
+    def trans_mask(self, x):
+        """
+        x: (N, L, patch_size**2 *1)
+        imgs: (N, 3, H, W)
+        """
+        p = self.patch_embed.patch_size[0] # type: ignore
+        h = w = int(x.shape[1]**.5)
+        assert h * w == x.shape[1]
+        
+        x = x.reshape(shape=(x.shape[0], h, w, p, p, 3))
+        x = torch.einsum('nhwpqc->nchpwq', x)
+        imgs = x.reshape(shape=(x.shape[0], 3, h * p, h * p))
+        return imgs
+
+    def forward(self, latent):
+        # imgs       = self.unpatchify(latent)
+        # feature    = self.FPN(imgs)
+        # new_latent = self.patchify(feature)
+        seg_latent = self.decoder(latent)
+        #mask       = self.trans_mask(seg_latent)
+        return seg_latent
+    
+
+class cross_fusion_mean(nn.Module):
+    def __init__(self,embed_dim):
+        super(cross_fusion_mean, self).__init__()
+        self.compare_model = nn.MultiheadAttention(embed_dim = embed_dim, num_heads = 16)
+        self.pos_embed = nn.Parameter(torch.zeros(1, 1600, embed_dim), requires_grad=False) 
+        self.embed_dim = embed_dim
+        self.fc1 = nn.Linear(self.embed_dim, self.embed_dim*4, bias=True)
+        self.fc2 = nn.Linear(self.embed_dim*4, self.embed_dim, bias=True)
+        self.gelu = nn.GELU()
+        self.initialize_weights()
+        
+    def initialize_weights(self):
+        pos_embed = get_2d_sincos_pos_embed(self.embed_dim, 40, cls_token=False)
+        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+
+    def forward(self, vi_latent, ir_latent):#, com_latent
+        #num         = vi_latent.shape[1]
+        vi_latent += self.pos_embed
+        ir_latent += self.pos_embed
+        mean_latant = (vi_latent+ir_latent)/2
+        vi_mean,_ = self.compare_model(mean_latant,vi_latent,vi_latent)
+        ir_mean,_ = self.compare_model(mean_latant,ir_latent,ir_latent)
+        latent = self.fc2(self.gelu(self.fc1(vi_mean+ir_mean)))
+        
+        return latent
+    
+class cross_fusion_FFN(nn.Module):  #tradition cross*2
+    def __init__(self,embed_dim):
+        super(cross_fusion_FFN, self).__init__()
+        self.cross_model = nn.MultiheadAttention(embed_dim = embed_dim, num_heads = 16)
+        self.merge_model = nn.MultiheadAttention(embed_dim = embed_dim, num_heads = 16)
+        self.pos_embed = nn.Parameter(torch.zeros(1, 1600, embed_dim), requires_grad=False) 
+        self.embed_dim = embed_dim
+        self.fc1 = nn.Linear(self.embed_dim, self.embed_dim*4, bias=True)
+        self.fc2 = nn.Linear(self.embed_dim*4, self.embed_dim, bias=True)
+        self.gelu = nn.GELU()
+        self.ln = nn.LayerNorm(self.embed_dim)
+
+        self.initialize_weights()
+        
+    def initialize_weights(self):
+        pos_embed = get_2d_sincos_pos_embed(self.embed_dim, 40, cls_token=False)
+        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+
+    def forward(self, vi_latent, ir_latent):#, com_latent
+        #num         = vi_latent.shape[1]
+        vi_latent += self.pos_embed
+        ir_latent += self.pos_embed
+        vi_patten,_  = self.cross_model(ir_latent,vi_latent,vi_latent)  #q,k,v
+        ir_patten,_  = self.cross_model(vi_latent,ir_latent,ir_latent)
+        patten = vi_patten + ir_patten
+        vi_final,_   = self.merge_model(patten,vi_latent,vi_latent)
+        ir_final,_   = self.merge_model(patten,ir_latent,ir_latent)
+        fusion    = (vi_final + ir_final)
+        ffn = self.fc2(self.gelu(self.fc1(fusion)))
+        out = self.ln(ffn+fusion)
+        return out
+
