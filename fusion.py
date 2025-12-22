@@ -94,6 +94,18 @@ class ASTG_Module(nn.Module):
         # 缓存高通掩码，避免重复创建
         self.register_buffer('high_pass_mask', None)
 
+    def build_soft_highpass_mask(Hf, Wf, device, dtype, cutoff_ratio=0.15, transition=0.05):
+        y = torch.arange(Hf, device=device, dtype=dtype)
+        x = torch.arange(Wf, device=device, dtype=dtype)
+        y = torch.minimum(y, (Hf - y))
+        fy = y / (Hf / 2.0 + 1e-6)
+        fx = x / (Wf - 1.0 + 1e-6)
+        r = torch.sqrt(fy[:, None] ** 2 + fx[None, :] ** 2)
+
+        # soft step: ~0 below cutoff, ~1 above cutoff
+        mask = torch.sigmoid((r - cutoff_ratio) / (transition + 1e-6))
+        return mask[None, None, :, :]
+
     def get_gradient(self, x):
         """
         提取特征图的梯度幅度作为纹理表征。
@@ -133,22 +145,32 @@ class ASTG_Module(nn.Module):
         # Step 1: 频域分支
         # ---------------------------
         # RFFT2D: 实数到复数 FFT
-        fft = torch.fft.rfft2(f_in, norm='backward') 
+        f_fft = f_in.float()
+        fft = torch.fft.rfft2(f_in, norm='ortho')
         mag = torch.abs(fft) # 幅度谱
+        mag = torch.log1p(mag)  # 或者 mag**2 再 log1p
         
         # 构建/获取高通掩码 (High-pass Mask)
+        Hf, Wf = mag.shape[-2], mag.shape[-1]
         _, _, h_freq, w_freq = mag.shape
-        if self.high_pass_mask is None or self.high_pass_mask.shape[-2:] != (h_freq, w_freq):
-            # 创建一个掩码，中心低频区域为0，其余为1
-            mask = torch.ones((h_freq, w_freq), device=x_fused.device)
-            # 简单的距离掩码，屏蔽左上角(DC分量附近)
-            # 注意: rfft2 的 DC 分量在 (0,0)
-            cutoff = min(h_freq, w_freq) // 8  # 过滤最低的 1/8 频率
-            mask[:cutoff, :cutoff] = 0 
-            self.high_pass_mask = mask[None, None, :, :]
-            
-        mag_high = mag * self.high_pass_mask
-        
+        # 构建/缓存 soft radial high-pass mask
+        need_rebuild = (
+                self.high_pass_mask is None
+                or self.high_pass_mask.shape[-2:] != (Hf, Wf)
+                or self.high_pass_mask.device != mag.device
+                or self.high_pass_mask.dtype != mag.dtype
+        )
+        if need_rebuild:
+            self.high_pass_mask = self.build_soft_highpass_mask(
+                Hf, Wf,
+                device=mag.device,
+                dtype=mag.dtype.float32,
+                cutoff_ratio=0.15,
+                transition=0.05
+            )
+
+        mag_high = mag * self.high_pass_mask.to(mag.dtype)
+
         # 全局谱池化: 对空间频率维度求平均 -> (B, C)
         channel_desc = mag_high.mean(dim=(-2, -1))
         
