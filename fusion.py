@@ -344,61 +344,61 @@ class Seg_module(nn.Module):
         return seg_latent
     
 
-class cross_fusion_mean(nn.Module):
-    def __init__(self,embed_dim):
-        super(cross_fusion_mean, self).__init__()
-        self.compare_model = nn.MultiheadAttention(embed_dim = embed_dim, num_heads = 16)
-        self.pos_embed = nn.Parameter(torch.zeros(1, 1600, embed_dim), requires_grad=False) 
-        self.embed_dim = embed_dim
-        self.fc1 = nn.Linear(self.embed_dim, self.embed_dim*4, bias=True)
-        self.fc2 = nn.Linear(self.embed_dim*4, self.embed_dim, bias=True)
-        self.gelu = nn.GELU()
-        self.initialize_weights()
-        
-    def initialize_weights(self):
-        pos_embed = get_2d_sincos_pos_embed(self.embed_dim, 40, cls_token=False)
-        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
-
-    def forward(self, vi_latent, ir_latent):#, com_latent
-        #num         = vi_latent.shape[1]
-        vi_latent += self.pos_embed
-        ir_latent += self.pos_embed
-        mean_latant = (vi_latent+ir_latent)/2
-        vi_mean,_ = self.compare_model(mean_latant,vi_latent,vi_latent)
-        ir_mean,_ = self.compare_model(mean_latant,ir_latent,ir_latent)
-        latent = self.fc2(self.gelu(self.fc1(vi_mean+ir_mean)))
-        
-        return latent
+# class cross_fusion_mean(nn.Module):
+#     def __init__(self,embed_dim):
+#         super(cross_fusion_mean, self).__init__()
+#         self.compare_model = nn.MultiheadAttention(embed_dim = embed_dim, num_heads = 16)
+#         self.pos_embed = nn.Parameter(torch.zeros(1, 1600, embed_dim), requires_grad=False)
+#         self.embed_dim = embed_dim
+#         self.fc1 = nn.Linear(self.embed_dim, self.embed_dim*4, bias=True)
+#         self.fc2 = nn.Linear(self.embed_dim*4, self.embed_dim, bias=True)
+#         self.gelu = nn.GELU()
+#         self.initialize_weights()
+#
+#     def initialize_weights(self):
+#         pos_embed = get_2d_sincos_pos_embed(self.embed_dim, 40, cls_token=False)
+#         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+#
+#     def forward(self, vi_latent, ir_latent):#, com_latent
+#         #num         = vi_latent.shape[1]
+#         vi_latent += self.pos_embed
+#         ir_latent += self.pos_embed
+#         mean_latant = (vi_latent+ir_latent)/2
+#         vi_mean,_ = self.compare_model(mean_latant,vi_latent,vi_latent)
+#         ir_mean,_ = self.compare_model(mean_latant,ir_latent,ir_latent)
+#         latent = self.fc2(self.gelu(self.fc1(vi_mean+ir_mean)))
+#
+#         return latent
     
-class cross_fusion_FFN(nn.Module):  #tradition cross*2
-    def __init__(self,embed_dim):
-        super(cross_fusion_FFN, self).__init__()
-        self.cross_model = nn.MultiheadAttention(embed_dim = embed_dim, num_heads = 16)
-        self.merge_model = nn.MultiheadAttention(embed_dim = embed_dim, num_heads = 16)
-        self.pos_embed = nn.Parameter(torch.zeros(1, 1600, embed_dim), requires_grad=False) 
-        self.embed_dim = embed_dim
-        self.fc1 = nn.Linear(self.embed_dim, self.embed_dim*4, bias=True)
-        self.fc2 = nn.Linear(self.embed_dim*4, self.embed_dim, bias=True)
-        self.gelu = nn.GELU()
-        self.ln = nn.LayerNorm(self.embed_dim)
-
-        self.initialize_weights()
-        
-    def initialize_weights(self):
-        pos_embed = get_2d_sincos_pos_embed(self.embed_dim, 40, cls_token=False)
-        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
-
-    def forward(self, vi_latent, ir_latent):#, com_latent
-        #num         = vi_latent.shape[1]
-        vi_latent += self.pos_embed
-        ir_latent += self.pos_embed
-        vi_patten,_  = self.cross_model(ir_latent,vi_latent,vi_latent)  #q,k,v
-        ir_patten,_  = self.cross_model(vi_latent,ir_latent,ir_latent)
-        patten = vi_patten + ir_patten
-        vi_final,_   = self.merge_model(patten,vi_latent,vi_latent)
-        ir_final,_   = self.merge_model(patten,ir_latent,ir_latent)
-        fusion    = (vi_final + ir_final)
-        ffn = self.fc2(self.gelu(self.fc1(fusion)))
-        out = self.ln(ffn+fusion)
-        return out
+# class cross_fusion_FFN(nn.Module):  #tradition cross*2
+#     def __init__(self,embed_dim):
+#         super(cross_fusion_FFN, self).__init__()
+#         self.cross_model = nn.MultiheadAttention(embed_dim = embed_dim, num_heads = 16)
+#         self.merge_model = nn.MultiheadAttention(embed_dim = embed_dim, num_heads = 16)
+#         self.pos_embed = nn.Parameter(torch.zeros(1, 1600, embed_dim), requires_grad=False)
+#         self.embed_dim = embed_dim
+#         self.fc1 = nn.Linear(self.embed_dim, self.embed_dim*4, bias=True)
+#         self.fc2 = nn.Linear(self.embed_dim*4, self.embed_dim, bias=True)
+#         self.gelu = nn.GELU()
+#         self.ln = nn.LayerNorm(self.embed_dim)
+#
+#         self.initialize_weights()
+#
+#     def initialize_weights(self):
+#         pos_embed = get_2d_sincos_pos_embed(self.embed_dim, 40, cls_token=False)
+#         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+#
+#     def forward(self, vi_latent, ir_latent):#, com_latent
+#         #num         = vi_latent.shape[1]
+#         vi_latent += self.pos_embed
+#         ir_latent += self.pos_embed
+#         vi_patten,_  = self.cross_model(ir_latent,vi_latent,vi_latent)  #q,k,v
+#         ir_patten,_  = self.cross_model(vi_latent,ir_latent,ir_latent)
+#         patten = vi_patten + ir_patten
+#         vi_final,_   = self.merge_model(patten,vi_latent,vi_latent)
+#         ir_final,_   = self.merge_model(patten,ir_latent,ir_latent)
+#         fusion    = (vi_final + ir_final)
+#         ffn = self.fc2(self.gelu(self.fc1(fusion)))
+#         out = self.ln(ffn+fusion)
+#         return out
 
