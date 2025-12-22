@@ -65,143 +65,7 @@ class SelfAttention(nn.Module):
 #         vi_gate, ir_gate = modal_weights.chunk(2, dim=-1)
 #         return vi_feat * vi_gate, ir_feat * ir_gate
 
-class ASTG_Module(nn.Module):
-    """
-    自适应谱纹理门控模块 (ASTG)
-    结合频域通道注意力和空间纹理注意力，对融合特征进行自适应增强。
-    """
-    def __init__(self, dim, reduction=4):
-        super().__init__()
-        
-        # 1. 频域感知分支 (Frequency-Aware Branch)
-        self.freq_gate = nn.Sequential(
-            nn.Linear(dim, dim // reduction),
-            nn.ReLU(),
-            nn.Linear(dim // reduction, dim),
-            nn.Sigmoid()
-        )
-        
-        # 2. 空间纹理分支 (Spatial-Texture Branch)
-        # 输入为 IR 和 ViS 的梯度图拼接 (2 channels)，输出为 1 channel 空间权重
-        self.spatial_gate = nn.Sequential(
-            nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False), # 7x7 大卷积核感知纹理连续性
-            nn.Sigmoid()
-        )
-        
-        # 可学习的缩放因子 alpha，初始化为0
-        self.alpha = nn.Parameter(torch.zeros(1))
-        
-        # 缓存高通掩码，避免重复创建
-        self.register_buffer('high_pass_mask', None)
 
-    def build_soft_highpass_mask(Hf, Wf, device, dtype, cutoff_ratio=0.15, transition=0.05):
-        y = torch.arange(Hf, device=device, dtype=dtype)
-        x = torch.arange(Wf, device=device, dtype=dtype)
-        y = torch.minimum(y, (Hf - y))
-        fy = y / (Hf / 2.0 + 1e-6)
-        fx = x / (Wf - 1.0 + 1e-6)
-        r = torch.sqrt(fy[:, None] ** 2 + fx[None, :] ** 2)
-
-        # soft step: ~0 below cutoff, ~1 above cutoff
-        mask = torch.sigmoid((r - cutoff_ratio) / (transition + 1e-6))
-        return mask[None, None, :, :]
-
-    def get_gradient(self, x):
-        """
-        提取特征图的梯度幅度作为纹理表征。
-        x: (B, C, H, W)
-        """
-        # 为了降低计算量并提取结构信息，先在通道维度求均值，得到 (B, 1, H, W)
-        # 也可以使用 max，但 mean 更能代表整体能量分布
-        structure_map = x.mean(dim=1, keepdim=True)
-        
-        # 定义 Sobel 算子
-        kernel_x = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]], device=x.device).view(1, 1, 3, 3)
-        kernel_y = torch.tensor([[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]], device=x.device).view(1, 1, 3, 3)
-        
-        grad_x = F.conv2d(structure_map, kernel_x, padding=1)
-        grad_y = F.conv2d(structure_map, kernel_y, padding=1)
-        
-        # 计算梯度幅值
-        grad = torch.sqrt(grad_x**2 + grad_y**2 + 1e-6)
-        return grad
-
-    def forward(self, x_fused, x_ir, x_vis):
-        """
-        x_fused: 融合后的特征 (B, N, C)
-        x_ir: 红外特征 (B, N, C)
-        x_vis: 可见光特征 (B, N, C)
-        """
-        B, N, C = x_fused.shape
-        H = W = int(math.sqrt(N))
-        assert H * W == N, "Feature map is not square!"
-
-        # 转换形状: (B, N, C) -> (B, C, H, W)
-        f_in = x_fused.transpose(1, 2).reshape(B, C, H, W)
-        f_ir = x_ir.transpose(1, 2).reshape(B, C, H, W)
-        f_vis = x_vis.transpose(1, 2).reshape(B, C, H, W)
-
-        # ---------------------------
-        # Step 1: 频域分支
-        # ---------------------------
-        # RFFT2D: 实数到复数 FFT
-        f_fft = f_in.float()
-        fft = torch.fft.rfft2(f_in, norm='ortho')
-        mag = torch.abs(fft) # 幅度谱
-        mag = torch.log1p(mag)  # 或者 mag**2 再 log1p
-        
-        # 构建/获取高通掩码 (High-pass Mask)
-        Hf, Wf = mag.shape[-2], mag.shape[-1]
-        _, _, h_freq, w_freq = mag.shape
-        # 构建/缓存 soft radial high-pass mask
-        need_rebuild = (
-                self.high_pass_mask is None
-                or self.high_pass_mask.shape[-2:] != (Hf, Wf)
-                or self.high_pass_mask.device != mag.device
-                or self.high_pass_mask.dtype != mag.dtype
-        )
-        if need_rebuild:
-            self.high_pass_mask = self.build_soft_highpass_mask(
-                Hf, Wf,
-                device=mag.device,
-                dtype=mag.dtype.float32,
-                cutoff_ratio=0.15,
-                transition=0.05
-            )
-
-        mag_high = mag * self.high_pass_mask.to(mag.dtype)
-
-        # 全局谱池化: 对空间频率维度求平均 -> (B, C)
-        channel_desc = mag_high.mean(dim=(-2, -1))
-        
-        # 生成通道权重 (B, C, 1, 1)
-        w_freq = self.freq_gate(channel_desc).unsqueeze(-1).unsqueeze(-1)
-
-        # ---------------------------
-        # Step 2: 空间纹理分支
-        # ---------------------------
-        grad_ir = self.get_gradient(f_ir)   # (B, 1, H, W)
-        grad_vis = self.get_gradient(f_vis) # (B, 1, H, W)
-        
-        # 拼接梯度图 (B, 2, H, W)
-        grad_concat = torch.cat([grad_ir, grad_vis], dim=1)
-        
-        # 生成空间权重 (B, 1, H, W)
-        w_spatial = self.spatial_gate(grad_concat)
-
-        # ---------------------------
-        # Step 3: 联合门控与重构
-        # ---------------------------
-        # 联合注意力: 关注高频通道中的强纹理区域
-        attention = w_freq * w_spatial # Broadcast: (B, C, H, W)
-        
-        # 残差增强
-        f_out = f_in * (1 + self.alpha * attention)
-        
-        # 还原形状: (B, C, H, W) -> (B, N, C)
-        f_out = f_out.flatten(2).transpose(1, 2)
-        
-        return f_out
 
 
 class ModalGate(nn.Module):
@@ -368,11 +232,6 @@ class cross_fusion(nn.Module):  #tradition cross*2
         self.fc2 = nn.Linear(self.embed_dim*4, self.embed_dim, bias=True)
         self.gelu = nn.GELU()
         self.ln = nn.LayerNorm(self.embed_dim)
-
-        # 使用 ASTG 模块替换原有的 ModalGate
-        # self.modal_gate = ModalGate(embed_dim)
-        self.astg = ASTG_Module(embed_dim)
-
         self.modal_gate = ModalGate(embed_dim)#门控
         self.initialize_weights()
         self.mode = mode
@@ -398,13 +257,9 @@ class cross_fusion(nn.Module):  #tradition cross*2
             return patten
         vi_final,_   = self.merge_model(patten,vi_latent,vi_latent)
         ir_final,_   = self.merge_model(patten,ir_latent,ir_latent)
-        fusion       = (vi_final + ir_final)
-        # vi_gated, ir_gated = self.modal_gate(vi_final, ir_final)
-        # fusion = (vi_gated + ir_gated)
-
-        # 应用 ASTG 模块进行增强
-        # 传入 sum 后的 fusion 特征作为基础，ir_final 和 vi_final 作为纹理引导参考
-        fusion = self.astg(fusion, ir_final, vi_final)
+        # fusion       = (vi_final + ir_final)
+        vi_gated, ir_gated = self.modal_gate(vi_final, ir_final)
+        fusion = (vi_gated + ir_gated)
 
         ffn = self.fc2(self.gelu(self.fc1(fusion)))
         out = self.ln(ffn+fusion)
