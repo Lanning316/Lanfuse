@@ -1,8 +1,68 @@
+# --- Python 通用忽略 ---
 __pycache__/
+*.py[cod]
+*$py.class
+*.so
+.ipynb_checkpoints/
+
+# --- 虚拟环境 (Virtual Environments) ---
+# 避免上传本地环境配置
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# --- IDE & 编辑器配置 ---
 .idea/
 .vscode/
+*.swp
+*.swo
+
+# --- 操作系统生成文件 ---
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# --- PyTorch & 模型权重 ---
+# 强烈建议忽略所有权重文件，避免仓库体积过大
+*.pth
+*.pt
+*.ckpt
+*.pkl
+# 之前的具体文件现在已被 *.pth 覆盖
+# checkpoint-50.pth
+# final_new_60.pth
+
+# --- 项目特定输出目录 (Project Specific) ---
+
+# 1. train.py 中的 --output_dir 默认目录
+output/
+
+# 2. train.py 中的 --log_dir 默认目录
+TMP/
+
+# 3. util/test_save.py 中生成的验证结果目录
+# 代码逻辑: folder_name = current_directory + '/val_' + task_name
+val_*/
+
+# 4. TensorBoard 默认日志目录 (如果有用到)
+runs/
+logs/
+
+# --- 数据集目录 (Datasets) ---
 testM3FD/
 testMSRS/
 trainMSRS/
-checkpoint-50.pth
-final_new_60.pth
+# 根据 README.md 可能存在的 TNO 数据集
+TNO_dataset/
+# 常见的通用数据目录
+data/
+datasets/
+
+# --- 其他 ---
+# 忽略下载的 zip 或 tar 文件
+*.zip
+*.tar.gz
