@@ -78,6 +78,8 @@ def get_args_parser():
                         help='Pre-training ckpt for MAE(4 layers decoder)')
     parser.add_argument('--fusion_weight', default='path/to/fusion/layer/wegt',
                         help='ckpt for fusion layer (w/o)')
+    parser.add_argument('--all_weight', default='path/to/fusion/all/wegt',
+                        help='ckpt for all layer (w/o)')
     
 
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
@@ -95,6 +97,11 @@ def get_args_parser():
     parser.add_argument('--dist_on_itp', action='store_true')
     parser.add_argument('--dist_url', default='env://',
                         help='url used to set up distributed training')
+    parser.add_argument('--training_mode', default="train_decoder_CFM_MFM", type=str,
+                        choices=['train_CFM_mean', 'train_CFM_fusion', 'train_MFM_mean_CFM_lock','train_MFM_fusion_CFM_lock',
+                                 'train_MFM_mean_CFM_open', 'train_MFM_fusion_CFM_open', 'train_decoder_only',
+                                 'train_decoder_MFM', 'train_decoder_CFM_MFM'],
+                        help='training_mode')
 
     return parser
 
@@ -114,7 +121,7 @@ def train(args):
     #load_model
     mae = models_mae.__dict__[args.model](norm_pix_loss=args.norm_pix_loss)
     
-    fusion_layer = fusion.cross_fusion(embed_dim=1024) #same as mae
+    fusion_layer = fusion.cross_fusion(embed_dim=1024, mode=args.training_mode) #same as mae
     # 替换后的初始化方式(修改）
 
 
@@ -135,12 +142,17 @@ def train(args):
     mae.load_state_dict(checkpoint_mae['model'], strict=True)
 
 
-    connect = connect_net.ConnectModel_MAE_Fuion(mae, fusion_layer)
-    #connect = connect_net.ConnectModel_MAE_Fuion(mae, fusion_layer, embed_dim=1024, num_heads=16)
-
+    connect = connect_net.ConnectModel_MAE_Fuion(mae, fusion_layer, mode=args.training_mode)
 
     connect = connect.to(device)
     connect = nn.DataParallel(connect, device_ids=device_ids)
+
+    # """
+    # Note:
+    # If you want to load the all weights trained at a certain stage, please use the following code to load them.
+    # all_wegt = torch.load(args.all_weight, map_location="cpu")
+    # connect.load_state_dict(all_wegt['model'], strict=True)
+    # """
 
     #transform
     data_transform = transforms.Compose([
@@ -180,15 +192,13 @@ def train(args):
 
             connect.train()
             optimizer.zero_grad()
-         
-            imgs_vi_latent = imgs_vi.to(device)
-            imgs_ir_latent = imgs_ir.to(device)
+
             imgs_vi = imgs_vi.to(device)  # 关键：将原始图像移到GPU
             imgs_ir = imgs_ir.to(device)  # 关键：将原始图像移到GPU
 
             with autocast(enabled=True):
                 result = connect(imgs_vi, imgs_ir)
-                result = connect.module.model1.unpatchify(result)
+
 
                 # ```
                 # The stage-one mean alignment loss function are:
@@ -200,10 +210,18 @@ def train(args):
                 # loss_total, loss_grad, loss_laplacian = Loss(recover ,imgs_vi ,imgs_ir)
                 # ```
 
-                recover = trans_img(result, std, mean)  #output_imgs
-                imgs_vi = trans_img(imgs_vi, std, mean) #vi_imgs
-                imgs_ir = trans_img(imgs_ir, std, mean) #ir_imgs
-                loss_total, loss_grad, loss_laplacian = Loss(recover ,imgs_vi ,imgs_ir)
+                if args.training_mode == 'train_CFM_mean' or args.training_mode == 'train_MFM_mean_CFM_lock' or args.training_mode == 'train_MFM_mean_CFM_open':
+                    vi_latent = connect.module.model1.forward_encoder(imgs_vi)
+                    ir_latent = connect.module.model1.forward_encoder(imgs_ir)
+                    loss_total = torch.mean((result - (vi_latent + ir_latent) / 2) ** 2)
+
+                else:
+                    result = connect.module.model1.unpatchify(result)
+                    recover = trans_img(result, std, mean)  # output_imgs
+                    imgs_vi = trans_img(imgs_vi, std, mean)  # vi_imgs
+                    imgs_ir = trans_img(imgs_ir, std, mean)  # ir_imgs
+                    loss_total, loss_grad, loss_laplacian = Loss(recover, imgs_vi, imgs_ir)
+
 
                 loss = torch.mean(loss_total)
 
@@ -211,6 +229,7 @@ def train(args):
                 loss_out_grad += torch.mean(loss_grad).item()
                 loss_out_laplacian += torch.mean(loss_laplacian).item()
                 #loss_out_ssim += torch.mean(loss_ssim).item()#新增
+
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
