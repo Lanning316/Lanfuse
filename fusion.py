@@ -130,6 +130,137 @@ class ModalGate(nn.Module):
         #应用门控，允许缩放范围为 [0, 2]
         return vi_feat * (1 + vi_gate), ir_feat * (1 + ir_gate)
 
+
+#
+#
+# class ModalGate(nn.Module):
+#     """Token-wise residual gating. Optional confidence injection."""
+#     def __init__(self, embed_dim: int, hidden_ratio: float = 0.5, cred_alpha: float = 1.0):
+#         super().__init__()
+#         hidden_dim = max(1, int(embed_dim * hidden_ratio))
+#         self.mlp = nn.Sequential(
+#             nn.Linear(embed_dim * 2, hidden_dim, bias=True),
+#             nn.GELU(),
+#             nn.Linear(hidden_dim, embed_dim * 2, bias=True),
+#         )
+#         # start near identity
+#         nn.init.zeros_(self.mlp[-1].weight)
+#         nn.init.zeros_(self.mlp[-1].bias)
+#
+#         self.cred_alpha = float(cred_alpha)
+#
+#         self.spatial_smooth = nn.Conv2d(
+#             embed_dim * 2, embed_dim * 2,
+#             kernel_size=3, padding=1,
+#             groups=embed_dim * 2, bias=False,
+#         )
+#         nn.init.constant_(self.spatial_smooth.weight, 1.0 / 9.0)
+#
+#     @staticmethod
+#     def _bn1(x: torch.Tensor):
+#         if x is None:
+#             return None
+#         if x.dim() == 2:
+#             return x.unsqueeze(-1)  # (B,N,1)
+#         if x.dim() == 3:
+#             return x
+#         raise ValueError(f"cred must be (B,N) or (B,N,1), got {x.shape}")
+#
+#     def forward(self, vi_feat: torch.Tensor, ir_feat: torch.Tensor,
+#                 cred_vi: torch.Tensor = None, cred_ir: torch.Tensor = None):
+#         # vi/ir: (B,N,C)
+#         gate_input = torch.cat([vi_feat, ir_feat], dim=-1)  # (B,N,2C)
+#         logits = self.mlp(gate_input)                       # (B,N,2C)
+#
+#         # optional spatial smoothing when N is square
+#         b, n, c2 = logits.shape
+#         gs = int(math.sqrt(n))
+#         if gs * gs == n:
+#             logits_2d = logits.view(b, gs, gs, c2).permute(0, 3, 1, 2)  # (B,2C,H,W)
+#             logits_2d = self.spatial_smooth(logits_2d)
+#             logits = logits_2d.permute(0, 2, 3, 1).reshape(b, n, c2)
+#
+#         vi_logit, ir_logit = logits.chunk(2, dim=-1)  # (B,N,C)
+#
+#         cred_vi = self._bn1(cred_vi)
+#         cred_ir = self._bn1(cred_ir)
+#         if (cred_vi is not None) and (cred_ir is not None):
+#             vi_logit = vi_logit + self.cred_alpha * cred_vi
+#             ir_logit = ir_logit + self.cred_alpha * cred_ir
+#
+#         vi_gate = torch.tanh(vi_logit)  # [-1,1]
+#         ir_gate = torch.tanh(ir_logit)
+#
+#         return vi_feat * (1.0 + vi_gate), ir_feat * (1.0 + ir_gate)
+#
+#
+# class TripleRouter(nn.Module):
+#     """Route among [vi, ir, bilin] per token."""
+#     def __init__(self, embed_dim: int, hidden_ratio: float = 0.5):
+#         super().__init__()
+#         hidden_dim = max(1, int(embed_dim * hidden_ratio))
+#         self.mlp = nn.Sequential(
+#             nn.Linear(embed_dim * 3, hidden_dim, bias=True),
+#             nn.GELU(),
+#             nn.Linear(hidden_dim, 3, bias=True),
+#         )
+#         # start near uniform
+#         nn.init.zeros_(self.mlp[-1].weight)
+#         nn.init.zeros_(self.mlp[-1].bias)
+#
+#     def forward(self, vi: torch.Tensor, ir: torch.Tensor, bilin: torch.Tensor,
+#                 tau: float = 1.0, topk: int = 0):
+#         x = torch.cat([vi, ir, bilin], dim=-1)  # (B,N,3C)
+#         logits = self.mlp(x)                   # (B,N,3)
+#         w = F.softmax(logits / max(tau, 1e-6), dim=-1)
+#
+#         if topk is not None and topk > 0 and topk < 3:
+#             topv, topi = torch.topk(w, k=topk, dim=-1)
+#             mask = torch.zeros_like(w).scatter_(-1, topi, 1.0)
+#             w = w * mask
+#             w = w / (w.sum(dim=-1, keepdim=True) + 1e-6)
+#
+#         return w, logits
+#
+#
+# def cred_from_cos(vi: torch.Tensor, ir: torch.Tensor, eps: float = 1e-6):
+#     """(B,N,1) in [0,1]"""
+#     vi_n = F.normalize(vi, dim=-1, eps=eps)
+#     ir_n = F.normalize(ir, dim=-1, eps=eps)
+#     sim = (vi_n * ir_n).sum(dim=-1, keepdim=True)      # [-1,1]
+#     return ((sim + 1.0) * 0.5).clamp(0.0, 1.0)
+#
+#
+# def entropy_from_probs(p: torch.Tensor, eps: float = 1e-6):
+#     p = p.clamp_min(eps)
+#     return -(p * p.log()).sum(dim=-1, keepdim=True)
+#
+#
+# def cred_from_attn_weights(attn_w: torch.Tensor, eps: float = 1e-6):
+#     """
+#     attn_w could be:
+#       - (B, Nq, Nk)
+#       - (Nq, Nk)
+#       - (B, heads, Nq, Nk)  [rare in some configs]
+#     return: (B, Nq, 1) in [0,1]
+#     """
+#     if attn_w.dim() == 2:  # (Nq,Nk)
+#         p = attn_w.unsqueeze(0)  # (1,Nq,Nk)
+#     elif attn_w.dim() == 3:  # (B,Nq,Nk)
+#         p = attn_w
+#     elif attn_w.dim() == 4:  # (B,H,Nq,Nk)
+#         p = attn_w.mean(dim=1)
+#     else:
+#         raise ValueError(f"Unsupported attn_w shape: {attn_w.shape}")
+#
+#     # normalize entropy by log(Nk)
+#     H = entropy_from_probs(p, eps=eps)                 # (B,Nq,1)
+#     H = H / math.log(p.size(-1) + eps)                 # [0,1] approx
+#     cred = (1.0 - H).clamp(0.0, 1.0)
+#     return cred
+#
+
+
 class SE_Block(nn.Module):
     def __init__(self, inchannel, ratio=16):
         super(SE_Block, self).__init__()
@@ -265,6 +396,154 @@ class cross_fusion(nn.Module):  #tradition cross*2
         out = self.ln(ffn+fusion)
         return out
 
+# class cross_fusion_ffn(nn.Module):  # tradition cross*2 + confidence + bilinear + routing
+#     def __init__(
+#         self,
+#         embed_dim,
+#         mode='eval',
+#         # ---- new knobs ----
+#         use_confidence: bool = True,
+#         confidence_type: str = "cos",   # "attn_entropy" or "cos"
+#         cred_alpha: float = 1.0,                 # how strong confidence affects ModalGate
+#         use_bilinear: bool = True,
+#         router_tau: float = 1.0,
+#         router_topk: int = 0,                    # 0=softmax, 2=top2 routing
+#         lambda_router_entropy: float = 0.0,      # >0 to add reg term
+#     ):
+#         super(cross_fusion_ffn, self).__init__()
+#         self.cross_model = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=16)
+#         self.merge_model = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=16)
+#
+#         self.pos_embed = nn.Parameter(torch.zeros(1, 1600, embed_dim), requires_grad=False)
+#         self.embed_dim = embed_dim
+#
+#         self.fc1 = nn.Linear(self.embed_dim, self.embed_dim * 4, bias=True)
+#         self.fc2 = nn.Linear(self.embed_dim * 4, self.embed_dim, bias=True)
+#         self.gelu = nn.GELU()
+#         self.ln = nn.LayerNorm(self.embed_dim)
+#
+#         # ---- new modules ----
+#         self.modal_gate = ModalGate(embed_dim, hidden_ratio=0.5, cred_alpha=cred_alpha)
+#
+#         self.use_bilinear = bool(use_bilinear)
+#         if self.use_bilinear:
+#             self.u_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+#             self.v_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+#
+#         self.triple_router = TripleRouter(embed_dim, hidden_ratio=0.5)
+#
+#         # ---- knobs ----
+#         self.use_confidence = bool(use_confidence)
+#         self.confidence_type = confidence_type
+#         self.router_tau = float(router_tau)
+#         self.router_topk = int(router_topk)
+#         self.lambda_router_entropy = float(lambda_router_entropy)
+#
+#         self.initialize_weights()
+#         self.mode = mode
+#         self._set_trainable_blocks(self.mode)
+#
+#     def initialize_weights(self):
+#         pos_embed = get_2d_sincos_pos_embed(self.embed_dim, 40, cls_token=False)
+#         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+#
+#     def _set_trainable_blocks(self, mode):
+#         # 只训练MFM或者MFM和decoder，不训练CFM时，CFM冻结
+#         if mode in ['train_MFM_mean_CFM_lock', 'train_MFM_fusion_CFM_lock', 'train_decoder_MFM']:
+#             for param in self.cross_model.parameters():
+#                 param.requires_grad = False
+#
+#     def _compute_confidence(self, vi_final: torch.Tensor, ir_final: torch.Tensor,
+#                             vi_attn_w: torch.Tensor = None, ir_attn_w: torch.Tensor = None):
+#         """
+#         return: cred_vi, cred_ir (B,N,1) or (None,None)
+#         """
+#         if not self.use_confidence:
+#             return None, None
+#
+#         if self.confidence_type == "attn_entropy" and (vi_attn_w is not None) and (ir_attn_w is not None):
+#             # vi_attn_w: attention map when q=ir, k/v=vi  -> reflects how ir queries vi
+#             # ir_attn_w: attention map when q=vi, k/v=ir
+#             # We compute token cred on the query side (Nq == N).
+#             cred_q_vi = cred_from_attn_weights(vi_attn_w)  # (B,N,1) (for ir queries)
+#             cred_q_ir = cred_from_attn_weights(ir_attn_w)  # (B,N,1) (for vi queries)
+#
+#             # Use both (simple average) to be symmetric
+#             cred = (cred_q_vi + cred_q_ir) * 0.5
+#             return cred, cred
+#
+#         # fallback: cosine consistency
+#         cred = cred_from_cos(vi_final, ir_final)
+#         return cred, cred
+#
+#     def _router_entropy_reg(self, weights: torch.Tensor):
+#         # weights: (B,N,3)
+#         if self.lambda_router_entropy <= 0:
+#             return None
+#         ent = -(weights.clamp_min(1e-6) * weights.clamp_min(1e-6).log()).sum(dim=-1)  # (B,N)
+#         return self.lambda_router_entropy * ent.mean()
+#
+#     def forward(self, vi_latent, ir_latent, return_gate_reg: bool = False, return_weights: bool = False):
+#         """
+#         vi_latent/ir_latent: (B,N,C)  你原代码就是这样用的
+#         return_gate_reg: True 时返回 (out, gate_reg, weights)
+#         """
+#         vi_latent = vi_latent + self.pos_embed
+#         ir_latent = ir_latent + self.pos_embed
+#
+#         # ---- CFM ----
+#         # 说明：MultiheadAttention 默认输入是 (L,N,E) unless batch_first=True
+#         # 你原来代码直接喂 (B,N,C) 也能跑，说明你项目里可能已经 batch_first=True 或者外部转置过
+#         # 为了不破坏你现有行为，这里保持调用方式不变，仅显式 need_weights=True
+#         vi_patten, vi_attn_w = self.cross_model(ir_latent, vi_latent, vi_latent, need_weights=True)
+#         ir_patten, ir_attn_w = self.cross_model(vi_latent, ir_latent, ir_latent, need_weights=True)
+#
+#         patten = vi_patten + ir_patten
+#         if self.mode in ['train_CFM_mean', 'train_CFM_fusion']:
+#             return patten
+#
+#         # ---- MFM ----
+#         vi_final, _ = self.merge_model(patten, vi_latent, vi_latent, need_weights=False)
+#         ir_final, _ = self.merge_model(patten, ir_latent, ir_latent, need_weights=False)
+#
+#         # ---- confidence ----
+#         cred_vi, cred_ir = self._compute_confidence(vi_final, ir_final, vi_attn_w, ir_attn_w)
+#
+#         # ---- confidence-aware ModalGate ----
+#         vi_gated, ir_gated = self.modal_gate(vi_final, ir_final, cred_vi=cred_vi, cred_ir=cred_ir)
+#
+#         # ---- bilinear branch ----
+#         if self.use_bilinear:
+#             bilin = self.u_proj(vi_gated) * self.v_proj(ir_gated)
+#         else:
+#             bilin = vi_gated * ir_gated  # simple multiplicative
+#
+#         # ---- 3-way routing ----
+#         weights, _ = self.triple_router(
+#             vi_gated, ir_gated, bilin,
+#             tau=self.router_tau,
+#             topk=self.router_topk
+#         )  # (B,N,3)
+#
+#         fusion = (
+#             weights[..., 0:1] * vi_gated +
+#             weights[..., 1:2] * ir_gated +
+#             weights[..., 2:3] * bilin
+#         )
+#
+#         # ---- FFN + LN ----
+#         ffn = self.fc2(self.gelu(self.fc1(fusion)))
+#         out = self.ln(ffn + fusion)
+#
+#         gate_reg = self._router_entropy_reg(weights)
+#
+#         if return_gate_reg and return_weights:
+#             return out, gate_reg, weights
+#         if return_gate_reg:
+#             return out, gate_reg
+#         if return_weights:
+#             return out, weights
+#         return out
 
     
 class Seg_module(nn.Module):
