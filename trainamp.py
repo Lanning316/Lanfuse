@@ -2,7 +2,7 @@ import argparse
 from pathlib import Path
 
 
-#from torch.utils.tensorboard import SummaryWriter
+from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader
 import torchvision.transforms as transforms
 import timm
@@ -111,7 +111,7 @@ def trans_img(img, std, mean):
 
 def train(args):
 
-    #writer = SummaryWriter(args.log_dir)  
+    writer = SummaryWriter(args.log_dir)
     
     #GPU
     device_ids = [int(device) for device in ((args.device).split(':')[1]).split(',')]
@@ -225,9 +225,23 @@ def train(args):
 
                 loss = torch.mean(loss_total)
 
+                # --- TensorBoard Logging ---
+                global_step = epoch * len(train_loader) + count
+                writer.add_scalar('Train/Loss_Total', loss_total.item(), global_step)
+                # 仅在定义了 loss_grad 时记录 (避免在 train_CFM_mean 模式下报错)
+                if 'loss_grad' in locals():
+                    writer.add_scalar('Train/Loss_Grad', loss_grad.item(), global_step)
+                if 'loss_laplacian' in locals():
+                    writer.add_scalar('Train/Loss_Laplacian', loss_laplacian.item(), global_step)
+                # ---------------------------
+
                 loss_out_fusion += torch.mean(loss_total).item()
-                loss_out_grad += torch.mean(loss_grad).item()
-                loss_out_laplacian += torch.mean(loss_laplacian).item()
+                # 注意：原代码这里直接使用 loss_out_grad += ... 可能会在 train_CFM_mean 模式下报错
+                # 建议也加上判断:
+                if 'loss_grad' in locals():
+                    loss_out_grad += torch.mean(loss_grad).item()
+                if 'loss_laplacian' in locals():
+                    loss_out_laplacian += torch.mean(loss_laplacian).item()
                 #loss_out_ssim += torch.mean(loss_ssim).item()#新增
 
 
