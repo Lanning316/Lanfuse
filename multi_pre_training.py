@@ -20,9 +20,9 @@ from util.load_data import MatchingImageDataset_mae
 
 def get_args_parser():
     parser = argparse.ArgumentParser('MAE decoder pre-training (DDP)', add_help=False)
-    parser.add_argument('--batch_size', default=16, type=int, help='Batch size per GPU')
+    parser.add_argument('--batch_size', default=32, type=int, help='Batch size per GPU')
     parser.add_argument('--epochs', default=80, type=int, help='Total training epochs')
-    parser.add_argument('--accum_iter', default=4, type=int, help='Accumulate gradient iterations')
+    parser.add_argument('--accum_iter', default=2, type=int, help='Accumulate gradient iterations')
 
     # Model parameters
     parser.add_argument('--model', default='mae_vit_large_patch16_decoder4_512', type=str,
@@ -247,9 +247,6 @@ def train_one_epoch(model, data_loader, optimizer, scaler, device, accum_iter, d
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
-        if (step + 1) % accum_iter != 0:
-            optimizer.step()
-            optimizer.zero_grad()
 
     return total_loss, count
 
