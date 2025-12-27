@@ -112,21 +112,28 @@ class SSIM(nn.Module):
         ssim_map = ssim_n / ssim_d
         return ssim_map.mean()
 
+# def rgb_to_gray(images):
+#     weight = torch.tensor([[[[0.2989]]],
+#                            [[[0.5870]]],
+#                            [[[0.1140]]]], dtype=torch.float32)
+#
+#     # Move the weight tensor to the same device as the images
+#     weight = weight.to(images.device)
+#
+#     # Applying the depthwise convolution
+#     gray_images = F.conv2d(images, weight=weight, groups=3)
+#
+#     # Since the output will have 3 separate channels, sum them up across the channel dimension
+#     gray_images = gray_images.sum(dim=1, keepdim=True)
+#
+#     return gray_images
+
 def rgb_to_gray(images):
-    weight = torch.tensor([[[[0.2989]]], 
-                           [[[0.5870]]], 
-                           [[[0.1140]]]], dtype=torch.float32)
+    # images: [B,3,H,W], assume already normalized
+    r, g, b = images[:, 0:1], images[:, 1:2], images[:, 2:3]
+    gray = 0.2989 * r + 0.5870 * g + 0.1140 * b
+    return gray
 
-    # Move the weight tensor to the same device as the images
-    weight = weight.to(images.device)
-
-    # Applying the depthwise convolution
-    gray_images = F.conv2d(images, weight=weight, groups=3)
-
-    # Since the output will have 3 separate channels, sum them up across the channel dimension
-    gray_images = gray_images.sum(dim=1, keepdim=True)
-
-    return gray_images
 
 
 class Sobelxy(nn.Module):
@@ -175,14 +182,23 @@ class Fusionloss(nn.Module):
         # self.gamma = gamma  # SSIM损失权重
 
     def forward(self,generate_img,image_vis,image_ir):
-        
-        
+        generate_img = generate_img.float()
+        image_vis = image_vis.float()
+        image_ir = image_ir.float()
+
+        if torch.rand(1).item() < 0.001:  # 偶尔打印，避免刷屏
+            print(
+                "vis:", image_vis.min().item(), image_vis.max().item(),
+                "ir:", image_ir.min().item(), image_ir.max().item(),
+                "gen:", generate_img.min().item(), generate_img.max().item()
+            )
+
         generate_img = rgb_to_gray(generate_img)
         image_vis = rgb_to_gray(image_vis)
         image_ir  = rgb_to_gray(image_ir)
-        
-        # x_in_max = torch.max(image_vis,image_ir)
-        # loss_in  = F.l1_loss(x_in_max,generate_img)
+
+        x_in_max = torch.max(image_vis, image_ir)
+        loss_in = F.l1_loss(x_in_max, generate_img)
 
         y_grad            = self.sobelconv(image_vis)
         ir_grad           = self.sobelconv(image_ir)
@@ -190,22 +206,15 @@ class Fusionloss(nn.Module):
         x_grad_joint      = torch.max(y_grad,ir_grad)
         loss_grad         = F.l1_loss(x_grad_joint,generate_img_grad)
         
-        y_laplacian            = self.laplacianconv(image_vis)
-        ir_laplacian           = self.laplacianconv(image_ir)
-        generate_img_laplacian = self.laplacianconv(generate_img)
+        y_laplacian            = torch.abs(self.laplacianconv(image_vis))
+        ir_laplacian           = torch.abs(self.laplacianconv(image_ir))
+        generate_img_laplacian = torch.abs(self.laplacianconv(generate_img))
         x_laplacian_joint      = torch.max(y_laplacian,ir_laplacian)
         loss_laplacian         = F.l1_loss(x_laplacian_joint,generate_img_laplacian)
 
-        # # 新增SSIM损失：生成图像与可见光/红外图像的结构相似性损失
-        # # SSIM值范围为[0,1]，用1-SSIM作为损失（值越小越好）
-        # ssim_vis = self.ssim(generate_img, image_vis)
-        # ssim_ir = self.ssim(generate_img, image_ir)
-        # loss_ssim = 1 - (ssim_vis + ssim_ir) / 2  # 平均两者的SSIM损失
 
-    
-
-        loss_total = self.alpha*loss_grad + self.beta*loss_laplacian
-        return loss_total,  loss_grad, loss_laplacian
+        loss_total = self.alpha*loss_grad + self.beta*loss_laplacian + self.gamma*loss_in
+        return loss_total,  loss_grad, loss_laplacian,  loss_in
 
         # loss_total = self.alpha * loss_grad + self.beta * loss_laplacian + self.gamma * loss_ssim
         # return loss_total, loss_grad, loss_laplacian, loss_ssim
