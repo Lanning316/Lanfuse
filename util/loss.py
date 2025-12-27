@@ -177,6 +177,7 @@ class Fusionloss(nn.Module):
         # self.Loss_ssim = kornia.losses.SSIMLoss(11, reduction='mean')
         self.alpha = alpha  
         self.beta  = beta
+        self.gamma = gamma
 
         # self.ssim = SSIM()  # 初始化SSIM计算模块
         # self.gamma = gamma  # SSIM损失权重
@@ -186,12 +187,16 @@ class Fusionloss(nn.Module):
         image_vis = image_vis.float()
         image_ir = image_ir.float()
 
-        if torch.rand(1).item() < 0.001:  # 偶尔打印，避免刷屏
-            print(
-                "vis:", image_vis.min().item(), image_vis.max().item(),
-                "ir:", image_ir.min().item(), image_ir.max().item(),
-                "gen:", generate_img.min().item(), generate_img.max().item()
-            )
+        generate_img = generate_img / 255.0
+        generate_img = generate_img.clamp(0, 1)
+        image_vis = image_vis / 255.0
+        image_ir = image_ir / 255.0
+
+        # print(
+        #     "vis:", image_vis.min().item(), image_vis.max().item(),
+        #     "ir:", image_ir.min().item(), image_ir.max().item(),
+        #     "gen:", generate_img.min().item(), generate_img.max().item()
+        # )
 
         generate_img = rgb_to_gray(generate_img)
         image_vis = rgb_to_gray(image_vis)

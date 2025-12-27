@@ -29,10 +29,10 @@ import connect_net
 
 def get_args_parser():
     parser = argparse.ArgumentParser('MAE Fusion', add_help=False)
-    parser.add_argument('--batch_size', default=8, type=int,
+    parser.add_argument('--batch_size', default=4, type=int,
                         help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
     parser.add_argument('--epochs', default=80, type=int)
-    parser.add_argument('--accum_iter', default=1, type=int,
+    parser.add_argument('--accum_iter', default=2, type=int,
                         help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
 
     # Model parameters
@@ -110,7 +110,6 @@ def trans_img(img, std, mean):
     return img
 
 def train(args):
-
     writer = SummaryWriter(args.log_dir)
     
     #GPU
@@ -129,7 +128,7 @@ def train(args):
         patch_size=16,
         mode=args.training_mode,
         num_heads=16,
-        use_freq_scale=False,  # 建议先 False（只上 AttInv）
+        use_freq_scale=True,  # 建议先 False（只上 AttInv）
     )
 
     # 替换后的初始化方式(修改）
@@ -180,7 +179,7 @@ def train(args):
     scaler = amp.GradScaler(enabled=args.device)
     param_groups = optim_factory.add_weight_decay(connect, args.weight_decay)
     optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
-    Loss = util.loss.Fusionloss(1,2,gamma=0).to(device)
+    Loss = util.loss.Fusionloss(1,2,0).to(device)
     #Loss = nn.DataParallel(Loss,device_ids=device_ids)
     
     image_mean = torch.tensor([0.485, 0.456, 0.406])
@@ -195,8 +194,9 @@ def train(args):
         loss_out_fusion = 0
         loss_out_grad = 0
         loss_out_laplacian = 0
-        #loss_out_ssim = 0  # 新增SSIM损失统计
+        loss_out_in = 0
         count    = 0
+        printed_gen_range = False
         for imgs_vi, imgs_ir in tqdm(train_loader):
         
 
@@ -230,7 +230,7 @@ def train(args):
                     recover = trans_img(result, std, mean)  # output_imgs
                     imgs_vi = trans_img(imgs_vi, std, mean)  # vi_imgs
                     imgs_ir = trans_img(imgs_ir, std, mean)  # ir_imgs
-                    loss_total, loss_grad, loss_laplacian = Loss(recover, imgs_vi, imgs_ir)
+                    loss_total, loss_grad, loss_laplacian, loss_in = Loss(recover, imgs_vi, imgs_ir)
 
 
                 loss = torch.mean(loss_total)
@@ -243,17 +243,27 @@ def train(args):
                     writer.add_scalar('Train/Loss_Grad', loss_grad.item(), global_step)
                 if 'loss_laplacian' in locals():
                     writer.add_scalar('Train/Loss_Laplacian', loss_laplacian.item(), global_step)
+                if 'loss_in' in locals():
+                    writer.add_scalar('Train/Loss_in', loss_in.item(), global_step)
                 # ---------------------------
 
                 loss_out_fusion += torch.mean(loss_total).item()
                 # 注意：原代码这里直接使用 loss_out_grad += ... 可能会在 train_CFM_mean 模式下报错
                 # 建议也加上判断:
                 if 'loss_grad' in locals():
-                    loss_out_grad += torch.mean(loss_grad).item()
+                    loss_out_grad      +=  torch.mean(loss_grad).item()
                 if 'loss_laplacian' in locals():
-                    loss_out_laplacian += torch.mean(loss_laplacian).item()
-                #loss_out_ssim += torch.mean(loss_ssim).item()#新增
+                    loss_out_laplacian +=  torch.mean(loss_laplacian).item()
+                if 'loss_in' in locals():
+                    loss_out_in        +=  torch.mean(loss_in).item()
 
+                if not printed_gen_range:
+                    print(
+                        f"[Epoch {epoch}] gen range: "
+                        f"min={recover.min().item():.4f}, "
+                        f"max={recover.max().item():.4f}"
+                    )
+                    printed_gen_range = True
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -265,7 +275,7 @@ def train(args):
             count += 1
             
         print('total: ',loss_out_fusion/count,'laplacian: ',loss_out_laplacian/count,
-              'grad: ',loss_out_grad/count)
+              'grad: ',loss_out_grad/count, 'in: ',loss_out_in/count)
         if args.output_dir and (epoch % 5 == 0 or epoch + 1 == args.epochs):
             # ```
             # Note：

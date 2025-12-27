@@ -48,7 +48,7 @@ def load_model(checkpoint_path):
     #model = prepare_model(arch="mae_decoder_4_size")
     #fusion_layer = fusion.cross_fusion(embed_dim=1024)
     model = prepare_model(arch="mae_decoder_4_640")
-    fusion_layer = fusion.cross_fusion(embed_dim=1024, img_size=640, patch_size=16)
+    fusion_layer = fusion.cross_fusion_fdam(embed_dim=1024, img_size=640, patch_size=16)
 
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
     connect = ConnectModel_MAE_Fuion(model, fusion_layer)

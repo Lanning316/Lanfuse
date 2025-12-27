@@ -421,7 +421,7 @@ class cross_fusion_fdam(nn.Module):
         patch_size=16,
         mode='eval',
         num_heads=16,
-        use_freq_scale: bool = False,
+        use_freq_scale: bool = True,
         freq_num_filters: int = 4,
         freq_group: int = 32,
     ):
@@ -439,6 +439,7 @@ class cross_fusion_fdam(nn.Module):
             lf_dy_weight=True, hf_dy_weight=True,
             ignore_cls_token=0
         )
+        #self.merge_model = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=16)
 
         # --- 动态计算参数（和原 cross_fusion 对齐） ---
         self.img_size = img_size
@@ -525,9 +526,11 @@ class cross_fusion_fdam(nn.Module):
         # ---- MFM: use patten as query to read each modality ----
         vi_final = self.merge_model(q_in=patten, kv_in=vi_latent, H=H, W=W)
         ir_final = self.merge_model(q_in=patten, kv_in=ir_latent, H=H, W=W)
-        fusion = (vi_final + ir_final)
-        # vi_gated, ir_gated = self.modal_gate(vi_final, ir_final)
-        # fusion = (vi_gated + ir_gated)
+        # vi_final, _ = self.merge_model(patten, vi_latent, vi_latent)
+        # ir_final, _ = self.merge_model(patten, ir_latent, ir_latent)
+        #fusion = (vi_final + ir_final)
+        vi_gated, ir_gated = self.modal_gate(vi_final, ir_final)
+        fusion = (vi_gated + ir_gated)
 
         # 可选：在 fusion 上做第二次频域增强（更激进，默认可关）
         fusion = self._apply_freq(fusion, which=2)
