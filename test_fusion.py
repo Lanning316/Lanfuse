@@ -63,7 +63,7 @@ if __name__ == '__main__':
     parser.add_argument('--address', type=str, required=True, help='Path to dataset address')
     parser.add_argument('--output', type=str, required=True, help='Folder path to save output images')
     parser.add_argument('--input_size', type=int, default=640, help='Input image size')
-    parser.add_argument('--model_arch', type=str, default='mae_vit_large_patch16_decoder4_512', help='Model architecture')
+    parser.add_argument('--model_arch', type=str, default='mae_vit_large_patch16_decoder4_640', help='Model architecture')
 
     args = parser.parse_args()
 
