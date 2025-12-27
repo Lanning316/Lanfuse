@@ -122,7 +122,16 @@ def train(args):
     mae = models_mae.__dict__[args.model](norm_pix_loss=args.norm_pix_loss)
     
     #fusion_layer = fusion.cross_fusion(embed_dim=1024, mode=args.training_mode) #same as mae
-    fusion_layer = fusion.cross_fusion(embed_dim=1024, img_size=args.input_size, patch_size=16, mode=args.training_mode)
+    #fusion_layer = fusion.cross_fusion(embed_dim=1024, img_size=args.input_size, patch_size=16, mode=args.training_mode)
+    fusion_layer = fusion.cross_fusion_fdam(
+        embed_dim=1024,
+        img_size=args.input_size,
+        patch_size=16,
+        mode=args.training_mode,
+        num_heads=16,
+        use_freq_scale=False,  # 建议先 False（只上 AttInv）
+    )
+
     # 替换后的初始化方式(修改）
 
 

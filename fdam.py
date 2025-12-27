@@ -95,6 +95,144 @@ class AttentionwithAttInv(nn.Module):
         x = self.proj(x_attn)
         x = self.proj_drop(x)
         return x
+    
+class CrossAttentionwithAttInv(nn.Module):
+    """
+    Cross-Attention version of AttentionwithAttInv (from fdam.py).
+
+    输入:
+      q_in:  (B, Nq, C)
+      kv_in: (B, Nk, C)  # 通常 Nk == Nq
+    输出:
+      out:   (B, Nq, C)
+
+    AttInv 核心:
+      x_attn = Attn(q,k,v)
+      v_hf   = v - x_attn   (当 Nk==Nq 时，逐 token 可减)
+      x_attn += x_attn * dy_lf * lf_gamma
+      x_attn += v_hf * dy_hf * hf_gamma
+    """
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 8,
+        qkv_bias: bool = False,
+        qk_scale=None,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+        lf_dy_weight: bool = True,
+        hf_dy_weight: bool = True,
+        ignore_cls_token: int = 0,
+    ):
+        super().__init__()
+        assert dim % num_heads == 0, "dim must be divisible by num_heads"
+        self.dim = dim
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim ** -0.5
+
+        # Cross-Attn: Wq on q_in, Wk/Wv on kv_in
+        self.q_proj = nn.Linear(dim, dim, bias=qkv_bias)
+        self.k_proj = nn.Linear(dim, dim, bias=qkv_bias)
+        self.v_proj = nn.Linear(dim, dim, bias=qkv_bias)
+
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        # 动态频率权重（同 fdam.py）
+        self.lf_dy_weight = lf_dy_weight
+        self.hf_dy_weight = hf_dy_weight
+
+        if self.lf_dy_weight:
+            self.dy_freq_2 = nn.Linear(dim, self.num_heads, bias=True)
+            self.lf_gamma = nn.Parameter(1e-5 * torch.ones((dim)), requires_grad=True)
+
+        if self.hf_dy_weight:
+            self.dy_freq = nn.Linear(dim, self.num_heads, bias=True)
+            self.hf_gamma = nn.Parameter(1e-5 * torch.ones((dim)), requires_grad=True)
+
+        # 用 StarReLU（和 fdam.py 对齐）；如果没导入成功，就 fallback 到普通 ReLU
+        if StarReLU is not None:
+            self.dy_freq_starrelu = StarReLU()
+        else:
+            self.dy_freq_starrelu = nn.ReLU(inplace=True)
+
+        self.ignore_cls_token = int(ignore_cls_token)
+
+    def forward(self, q_in: torch.Tensor, kv_in: torch.Tensor, H=None, W=None) -> torch.Tensor:
+        """
+        H/W 在这里不强依赖（主要给 freq_scale 用），保留接口对齐。
+        """
+        B, Nq, C = q_in.shape
+        B2, Nk, C2 = kv_in.shape
+        assert B == B2 and C == C2, "q_in and kv_in batch/channel must match"
+
+        # -------- dy weight from q branch (更合理：另一模态的 query 决定强调什么频段) --------
+        q_tokens = q_in[:, self.ignore_cls_token:] if self.ignore_cls_token > 0 else q_in
+        dy_feat = self.dy_freq_starrelu(q_tokens)  # (B, Nq-ig, C)
+
+        dy_freq_lf = None
+        if hasattr(self, "dy_freq_2"):
+            dy_freq_lf = self.dy_freq_2(dy_feat).tanh_()  # (B, Nq-ig, heads)
+            dy_freq_lf = dy_freq_lf.reshape(B, Nq - self.ignore_cls_token, self.num_heads, 1)\
+                                   .repeat(1, 1, 1, C // self.num_heads)\
+                                   .reshape(B, Nq - self.ignore_cls_token, C)
+            if self.ignore_cls_token > 0:
+                dy_freq_lf = torch.cat(
+                    [torch.zeros([B, self.ignore_cls_token, C], device=q_in.device, dtype=q_in.dtype),
+                     dy_freq_lf],
+                    dim=1
+                )
+
+        dy_freq_hf = None
+        if hasattr(self, "dy_freq"):
+            dy = F.softplus(self.dy_freq(dy_feat))  # (B, Nq-ig, heads)
+            dy2 = dy ** 2
+            dy = 2 * dy2 / (dy2 + 0.3678)          # fdam.py 同款归一化
+            dy = dy.reshape(B, Nq - self.ignore_cls_token, self.num_heads, 1)\
+                   .repeat(1, 1, 1, C // self.num_heads)\
+                   .reshape(B, Nq - self.ignore_cls_token, C)
+            if self.ignore_cls_token > 0:
+                dy = torch.cat(
+                    [torch.zeros([B, self.ignore_cls_token, C], device=q_in.device, dtype=q_in.dtype),
+                     dy],
+                    dim=1
+                )
+            dy_freq_hf = dy
+
+        # -------- Cross-Attention --------
+        q = self.q_proj(q_in).reshape(B, Nq, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)  # (B, h, Nq, d)
+        k = self.k_proj(kv_in).reshape(B, Nk, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)  # (B, h, Nk, d)
+        v = self.v_proj(kv_in).reshape(B, Nk, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)  # (B, h, Nk, d)
+
+        q = q * self.scale
+        attn = (q @ k.transpose(-2, -1))  # (B, h, Nq, Nk)
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x_attn = (attn @ v).transpose(1, 2).reshape(B, Nq, C)  # (B, Nq, C)
+
+        # -------- Attention Inversion (AttInv) --------
+        # 关键：这里要求 Nk == Nq（你当前融合正好是这样）
+        if Nk == Nq:
+            v_reshape = v.permute(0, 2, 1, 3).reshape(B, Nk, C)  # (B, N, C)
+            v_hf = v_reshape - x_attn
+        else:
+            # 如果未来你搞了不同分辨率/不同 token 数，这里给个退化版本，避免直接炸掉：
+            # 用 v 的均值作为“对应 token”的近似。
+            v_mean = v.mean(dim=2, keepdim=False).permute(0, 2, 1).reshape(B, 1, C).expand(B, Nq, C)
+            v_hf = v_mean - x_attn
+
+        if dy_freq_lf is not None:
+            x_attn = x_attn + x_attn * dy_freq_lf * self.lf_gamma.view(1, 1, -1)
+
+        if dy_freq_hf is not None:
+            x_attn = x_attn + dy_freq_hf * v_hf * self.hf_gamma.view(1, 1, -1)
+
+        out = self.proj(x_attn)
+        out = self.proj_drop(out)
+        return out
 
 class Mlp(nn.Module):
     def __init__(self, dim, mlp_ratio=4, out_features=None, act_layer=StarReLU, drop=0.,

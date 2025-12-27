@@ -5,6 +5,9 @@ from timm.models.vision_transformer import PatchEmbed, Block
 from util.pos_embed import get_2d_sincos_pos_embed
 import torch.nn.functional as F
 
+from fdam import GroupDynamicScale, to_4d, to_3d, StarReLU,CrossAttentionwithAttInv
+import fdam
+
 
 class SelfAttention(nn.Module):
     def __init__(self, embed_dim, num_heads):
@@ -400,6 +403,137 @@ class cross_fusion(nn.Module):  #tradition cross*2
 
         ffn = self.fc2(self.gelu(self.fc1(fusion)))
         out = self.ln(ffn+fusion)
+        return out
+    
+class cross_fusion_fdam(nn.Module):
+    """
+    方案A：用 CrossAttentionwithAttInv 替换原 cross_fusion 的 cross_model / merge_model
+
+    - CFM:  vi_patten = CrossAttn(q=ir, kv=vi), ir_patten = CrossAttn(q=vi, kv=ir)
+    - MFM:  vi_final  = CrossAttn(q=patten, kv=vi), ir_final = CrossAttn(q=patten, kv=ir)
+    - 仍然沿用 ModalGate + FFN + LN 的输出结构，保证与后续代码兼容
+    - 可选：开启 GroupDynamicScale 做频域增强（默认关闭，更稳）
+    """
+    def __init__(
+        self,
+        embed_dim,
+        img_size=640,
+        patch_size=16,
+        mode='eval',
+        num_heads=16,
+        use_freq_scale: bool = False,
+        freq_num_filters: int = 4,
+        freq_group: int = 32,
+    ):
+        super(cross_fusion_fdam, self).__init__()
+
+        self.cross_model = CrossAttentionwithAttInv(
+            dim=embed_dim, num_heads=num_heads, qkv_bias=False,
+            attn_drop=0.0, proj_drop=0.0,
+            lf_dy_weight=True, hf_dy_weight=True,
+            ignore_cls_token=0
+        )
+        self.merge_model = CrossAttentionwithAttInv(
+            dim=embed_dim, num_heads=num_heads, qkv_bias=False,
+            attn_drop=0.0, proj_drop=0.0,
+            lf_dy_weight=True, hf_dy_weight=True,
+            ignore_cls_token=0
+        )
+
+        # --- 动态计算参数（和原 cross_fusion 对齐） ---
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.grid_size = img_size // patch_size
+        self.num_patches = self.grid_size ** 2
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim), requires_grad=False)
+
+        self.embed_dim = embed_dim
+        self.mode = mode
+
+        self.fc1 = nn.Linear(self.embed_dim, self.embed_dim * 4, bias=True)
+        self.fc2 = nn.Linear(self.embed_dim * 4, self.embed_dim, bias=True)
+        self.gelu = nn.GELU()
+        self.ln = nn.LayerNorm(self.embed_dim)
+
+        self.modal_gate = ModalGate(embed_dim)
+
+        # init pos_embed
+        self.initialize_weights()
+
+        # 可选频域增强（默认关）
+        self.use_freq_scale = bool(use_freq_scale)
+        if self.use_freq_scale:
+            assert GroupDynamicScale is not None, "GroupDynamicScale not available. Ensure fdam.py is importable."
+            # 注意：size 需要与 token 的 H/W 对齐；这里用 grid_size
+            self.freq_scale_1 = GroupDynamicScale(
+                dim=embed_dim,
+                num_filters=freq_num_filters,
+                size=self.grid_size,
+                group=freq_group,
+                init_scale=1e-5,
+            )
+            self.freq_scale_2 = GroupDynamicScale(
+                dim=embed_dim,
+                num_filters=freq_num_filters,
+                size=self.grid_size,
+                group=freq_group,
+                init_scale=1e-5,
+            )
+
+        self._set_trainable_blocks(mode)
+
+    def initialize_weights(self):
+        pos_embed = get_2d_sincos_pos_embed(self.embed_dim, self.grid_size, cls_token=False)
+        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+
+    def _set_trainable_blocks(self, mode):
+        # 和原 cross_fusion 逻辑一致：只训 MFM/decoder 时冻结 CFM（cross_model）
+        if mode in ['train_MFM_mean_CFM_lock', 'train_MFM_fusion_CFM_lock', 'train_decoder_MFM']:
+            for p in self.cross_model.parameters():
+                p.requires_grad = False
+
+    def _apply_freq(self, x: torch.Tensor, which: int):
+        # x: (B, N, C) -> (B, C, H, W) -> (B, N, C)
+        if not self.use_freq_scale:
+            return x
+        H = W = self.grid_size
+        x4 = to_4d(x, H, W)
+        if which == 1:
+            x4 = self.freq_scale_1(x4) + x4
+        else:
+            x4 = self.freq_scale_2(x4) + x4
+        return to_3d(x4)
+
+    def forward(self, vi_latent, ir_latent):
+        # vi_latent / ir_latent: (B, N, C)
+        vi_latent = vi_latent + self.pos_embed
+        ir_latent = ir_latent + self.pos_embed
+
+        H = W = self.grid_size
+
+        # ---- CFM: cross attention both directions ----
+        vi_patten = self.cross_model(q_in=ir_latent, kv_in=vi_latent, H=H, W=W)
+        ir_patten = self.cross_model(q_in=vi_latent, kv_in=ir_latent, H=H, W=W)
+        patten = vi_patten + ir_patten
+
+        # 可选：在 CFM 输出上做一次频域增强（更保守：你也可以关掉只做 AttInv）
+        patten = self._apply_freq(patten, which=1)
+
+        if self.mode in ['train_CFM_mean', 'train_CFM_fusion']:
+            return patten
+
+        # ---- MFM: use patten as query to read each modality ----
+        vi_final = self.merge_model(q_in=patten, kv_in=vi_latent, H=H, W=W)
+        ir_final = self.merge_model(q_in=patten, kv_in=ir_latent, H=H, W=W)
+        fusion = (vi_final + ir_final)
+        # vi_gated, ir_gated = self.modal_gate(vi_final, ir_final)
+        # fusion = (vi_gated + ir_gated)
+
+        # 可选：在 fusion 上做第二次频域增强（更激进，默认可关）
+        fusion = self._apply_freq(fusion, which=2)
+
+        ffn = self.fc2(self.gelu(self.fc1(fusion)))
+        out = self.ln(ffn + fusion)
         return out
 
 # class cross_fusion_ffn(nn.Module):  # tradition cross*2 + confidence + bilinear + routing
