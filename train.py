@@ -120,8 +120,9 @@ def train(args):
     
     #load_model
     mae = models_mae.__dict__[args.model](norm_pix_loss=args.norm_pix_loss)
-    
-    fusion_layer = fusion.cross_fusion(embed_dim=1024, mode=args.training_mode) #same as mae
+
+    # fusion_layer = fusion.cross_fusion(embed_dim=1024, mode=args.training_mode) #same as mae
+    fusion_layer = fusion.cross_fusion(embed_dim=1024, img_size=args.input_size, patch_size=16, mode=args.training_mode)
     # 替换后的初始化方式(修改）
 
 

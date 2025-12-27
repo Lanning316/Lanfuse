@@ -353,11 +353,17 @@ class Feature_Net(nn.Module):
     
 
 class cross_fusion(nn.Module):  #tradition cross*2
-    def __init__(self,embed_dim, mode='eval'):
+    def __init__(self,embed_dim,img_size=640, patch_size=16, mode='eval'):
         super(cross_fusion, self).__init__()
         self.cross_model = nn.MultiheadAttention(embed_dim = embed_dim, num_heads = 16)
         self.merge_model = nn.MultiheadAttention(embed_dim = embed_dim, num_heads = 16)
-        self.pos_embed = nn.Parameter(torch.zeros(1, 1600, embed_dim), requires_grad=False)
+        # --- 动态计算参数 ---
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.grid_size = img_size // patch_size
+        self.num_patches = self.grid_size ** 2  # 例如 512/16=32, 32*32=1024
+        # ------------------
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim), requires_grad=False)
         self.embed_dim = embed_dim
         self.fc1 = nn.Linear(self.embed_dim, self.embed_dim*4, bias=True)
         self.fc2 = nn.Linear(self.embed_dim*4, self.embed_dim, bias=True)
@@ -369,7 +375,7 @@ class cross_fusion(nn.Module):  #tradition cross*2
         self._set_trainable_blocks(self.mode)
 
     def initialize_weights(self):
-        pos_embed = get_2d_sincos_pos_embed(self.embed_dim, 40, cls_token=False)
+        pos_embed = get_2d_sincos_pos_embed(self.embed_dim, self.grid_size, cls_token=False)
         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
 
     def _set_trainable_blocks(self, mode):

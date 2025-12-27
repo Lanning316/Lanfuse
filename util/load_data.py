@@ -282,7 +282,7 @@ def get_image_type(name,path):
         if os.path.exists(image_path):
             return type
 
-def get_train_images(path ,names):
+def get_train_images(path ,names, size=640):
 
     vi_path = path + '/vi/'
     ir_path = path + '/ir/'
@@ -300,11 +300,18 @@ def get_train_images(path ,names):
         img_vi = cv2.cvtColor(img_vi, cv2.COLOR_BGR2RGB)   
         img_ir = cv2.cvtColor(img_ir, cv2.COLOR_BGR2RGB)
 
-        img_vi = cv2.resize(img_vi,(640,640),cv2.INTER_CUBIC) # type: ignore
-        img_ir = cv2.resize(img_ir,(640,640),cv2.INTER_CUBIC) # type: ignore
+        # img_vi = cv2.resize(img_vi,(640,640),cv2.INTER_CUBIC) # type: ignore
+        # img_ir = cv2.resize(img_ir,(640,640),cv2.INTER_CUBIC) # type: ignore
 
-        img_vi = normalize_image(img_vi)
-        img_ir = normalize_image(img_ir)
+        # img_vi = normalize_image(img_vi)
+        # img_ir = normalize_image(img_ir)
+
+        # 替换硬编码 (640,640)
+        img_vi = cv2.resize(img_vi, (size, size), cv2.INTER_CUBIC) 
+        img_ir = cv2.resize(img_ir, (size, size), cv2.INTER_CUBIC)
+
+        img_vi = normalize_image(img_vi, size=size)
+        img_ir = normalize_image(img_ir, size=size)
 
         VI.append(img_vi)
         IR.append(img_ir)

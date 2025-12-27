@@ -275,5 +275,5 @@ mae_vit_base_patch16 = mae_vit_base_patch16_dec512d8b  # decoder: 512 dim, 8 blo
 mae_vit_large_patch16= mae_vit_large_patch16_dec512d8b  # decoder: 512 dim, 8 blocks
 mae_vit_huge_patch14 = mae_vit_huge_patch14_dec512d8b  # decoder: 512 dim, 8 blocks
 mae_decoder_4_640    = mae_vit_large_patch16_decoder4_640
-mae_decoder_4_512 = mae_vit_large_patch16_decoder4_512
+mae_decoder_4_512    = mae_vit_large_patch16_decoder4_512
 mae_vit_base_patch16_v = mae_vit_base_patch16_dec512d8b_v

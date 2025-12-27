@@ -39,13 +39,16 @@ def show_image(image, title=''):
 def normalize_image(img):
     img = img / 255.
     assert img.shape == (640, 640, 3)
+    #assert img.shape == (512, 512, 3)
     img = img - imagenet_mean
     img = img / imagenet_std
     return img
 
 def load_model(checkpoint_path):
+    #model = prepare_model(arch="mae_decoder_4_size")
+    #fusion_layer = fusion.cross_fusion(embed_dim=1024)
     model = prepare_model(arch="mae_decoder_4_640")
-    fusion_layer = fusion.cross_fusion(embed_dim=1024)
+    fusion_layer = fusion.cross_fusion(embed_dim=1024, img_size=640, patch_size=16)
 
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
     connect = ConnectModel_MAE_Fuion(model, fusion_layer)
@@ -59,12 +62,15 @@ if __name__ == '__main__':
     parser.add_argument('--checkpoint', type=str, required=True, help='Path to model checkpoint')
     parser.add_argument('--address', type=str, required=True, help='Path to dataset address')
     parser.add_argument('--output', type=str, required=True, help='Folder path to save output images')
-    
+    parser.add_argument('--input_size', type=int, default=640, help='Input image size')
+    parser.add_argument('--model_arch', type=str, default='mae_vit_large_patch16_decoder4_512', help='Model architecture')
+
     args = parser.parse_args()
 
     connect = load_model(args.checkpoint)
     address = args.address
     folder_path = args.output
+    size = args.input_size
 
     names = get_address(address)
     type = get_image_type(names[0], address + "/vi/")
@@ -84,8 +90,9 @@ if __name__ == '__main__':
         h, w, _ = img_vi.shape
         target_size = (w, h)
 
-        img_vi = cv2.resize(img_vi, (640, 640), cv2.INTER_CUBIC)
-        img_ir = cv2.resize(img_ir, (640, 640), cv2.INTER_CUBIC)
+        img_vi = cv2.resize(img_vi, (size, size), cv2.INTER_CUBIC)
+        img_ir = cv2.resize(img_ir, (size, size), cv2.INTER_CUBIC)
+        
 
         img_vi = normalize_image(img_vi)
         img_ir = normalize_image(img_ir)
@@ -103,7 +110,7 @@ if __name__ == '__main__':
         pred = pred.numpy()
         pred = cv2.convertScaleAbs(pred)
         y = cv2.cvtColor(pred, cv2.COLOR_RGB2GRAY)
-        img_vi_ycrcb = cv2.resize(img_vi_ycrcb, (640, 640), cv2.INTER_CUBIC)  # type: ignore
+        img_vi_ycrcb = cv2.resize(img_vi_ycrcb, (size, size), cv2.INTER_CUBIC)  # type: ignore
         img_vi_ycrcb[:, :, 0] = y
         out = cv2.cvtColor(img_vi_ycrcb, cv2.COLOR_YCrCb2BGR)
         out = cv2.resize(out, target_size, interpolation=cv2.INTER_CUBIC)

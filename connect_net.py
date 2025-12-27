@@ -104,6 +104,7 @@ class ConnectModel_MAE_Fuion(nn.Module):
         img = self.model1.unpatchify(x)
         return img
 
+    #好像是融合验证集用的，可以先不看
     def val_forward(self, vi, ir):
         vi_latent = self.model1.forward_encoder(vi)
         ir_latent = self.model1.forward_encoder(ir)

@@ -72,10 +72,10 @@ def get_args_parser():
                         help='device to use for training')
     parser.add_argument('--seed', default=0, type=int)
 
-    # parser.add_argument('--resume', default='output_decoder_4_640/checkpoint-50.pth',
-    #                     help='Pre-training ckpt for MAE(4 layers decoder)')
     parser.add_argument('--resume', default='./checkpoint-50.pth',
                         help='Pre-training ckpt for MAE(4 layers decoder)')
+    # parser.add_argument('--resume', default='./checkpoint-50.pth',
+    #                     help='Pre-training ckpt for MAE(4 layers decoder)')
     parser.add_argument('--fusion_weight', default='path/to/fusion/layer/wegt',
                         help='ckpt for fusion layer (w/o)')
     parser.add_argument('--all_weight', default='path/to/fusion/all/wegt',
@@ -121,7 +121,8 @@ def train(args):
     #load_model
     mae = models_mae.__dict__[args.model](norm_pix_loss=args.norm_pix_loss)
     
-    fusion_layer = fusion.cross_fusion(embed_dim=1024, mode=args.training_mode) #same as mae
+    #fusion_layer = fusion.cross_fusion(embed_dim=1024, mode=args.training_mode) #same as mae
+    fusion_layer = fusion.cross_fusion(embed_dim=1024, img_size=args.input_size, patch_size=16, mode=args.training_mode)
     # 替换后的初始化方式(修改）
 
 
